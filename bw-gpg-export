@@ -1,0 +1,133 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [ -z "$(which bw)" ]; then
+  echo >&2 "ERROR: Bitwarden CLI (bw) not installed."
+  exit 1
+fi
+
+if [ -z "$(which gpg)" ]; then
+  echo >&2 "ERROR: GnuPG not installed."
+  exit 1
+fi
+
+if [ -z "$(which jq)" ]; then
+  echo >&2 "ERROR: jq not installed."
+  exit 1
+fi
+
+cat <<EOF
+This is a simple tool to make it easy to export your Bitwarden vault and
+encrypt it with GnuPG symmetric encryption. This will not store any
+unencrypted data on disk.
+
+EOF
+
+BW_STATUS="$(bw status | jq -r .status)"
+if [ "$BW_STATUS" = unauthenticated ]; then
+  cat <<EOF
+You will need your Bitwarden API key (client_id and client_secret). It can
+be found in your web vault (https://vault.bitwarden.com/) by going to:
+Settings / My Account / API Key.
+EOF
+  echo
+  read -p "client_id: " BW_CLIENTID
+  read -p "client_secret: " BW_CLIENTSECRET
+  BW_CLIENTID="$(echo "$BW_CLIENTID" | tr -d '[:space:]')" \
+  BW_CLIENTSECRET="$(echo "$BW_CLIENTSECRET" | tr -d '[:space:]')" \
+    bw login --apikey --raw
+  echo
+fi
+
+BW_STATUS="$(bw status | jq -r .status)"
+if [ "$BW_STATUS" = locked ]; then
+  BW_EMAIL="$(bw status | jq -r .userEmail)"
+  echo "Unlocking vault for $BW_EMAIL..."
+  echo
+  read -s -p "Enter your master password [no echo]: " BW_PASSWORD
+  echo
+  [ -z "$BW_PASSWORD" ] && exit 1
+  export BW_SESSION="$(BW_PASSWORD="$BW_PASSWORD" bw \
+    unlock --passwordenv BW_PASSWORD --raw)"
+fi
+
+if [ -z "$BW_SESSION" ]; then
+  echo >&2 "ERROR: Could unlock your vault, exiting..."
+  exit 1
+fi
+
+BW_ORGS_JSON="$(bw list organizations)"
+BW_ORG_COUNT="$(echo "$BW_ORGS_JSON" | jq '. | length')"
+BW_ORG_ID=
+if [ $BW_ORG_COUNT -gt 0 ]; then
+  while true; do
+    echo
+    echo "Select an organization to export:"
+    echo
+    echo "0. No organization (your account)"
+    echo "$BW_ORGS_JSON" | jq -r 'to_entries | .[] | 
+      {index: .key, name: .value.name} | "\(.index + 1). \(.name)"'
+    echo
+    read -p "Choose (0-$BW_ORG_COUNT): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      if [ "$choice" -eq 0 ]; then
+        break
+      elif [ "$choice" -ge 1 -a "$choice" -le $BW_ORG_COUNT ]; then
+        BW_ORG_ID="$(echo "$BW_ORGS_JSON" | jq -r ".[$(($choice - 1))].id")"
+        break
+      fi
+    fi
+    echo
+    echo "Invalid choice: $choice"
+  done
+fi
+
+if [ -n "$BW_ORG_ID" ]; then
+  BW_ORG_ARG="--organizationid $BW_ORG_ID"
+else
+  BW_ORG_ARG=
+fi
+
+BW_ITEM_COUNT="$(bw list items $BW_ORG_ARG | jq '. | length')"
+if [ "$BW_ITEM_COUNT" -lt 1 ]; then
+  echo >&2 "ERROR: No items to export, exiting..."
+  exit 1
+fi
+echo
+echo "$BW_ITEM_COUNT items will be exported to a GnuPG symmetric encrypted file."
+
+while true; do
+  echo
+  read -s -p "Enter export password [no echo]: " GPG_SYMMETRIC_PASSWORD
+  echo
+  read -s -p "             again... [no echo]: " GPG_SYMMETRIC_PASSWORD2
+  echo
+  if [ "$GPG_SYMMETRIC_PASSWORD" != "$GPG_SYMMETRIC_PASSWORD2" ]; then
+    echo
+    echo "Passwords do no match. Try again..."
+    continue
+  fi
+  if [ -z "$GPG_SYMMETRIC_PASSWORD" ]; then
+    echo
+    echo "Empty password not allowed. Try again..."
+    continue
+  fi
+  break
+done
+
+BW_EXPORT_PATH="bitwarden-export-$(date +%Y%m%d-%H%M%S).json.gpg"
+
+echo
+echo -n "Exporting vault to: $BW_EXPORT_PATH"
+
+bw export --format json --raw $BW_ORG_ARG |
+  gpg --quiet --symmetric --output "$BW_EXPORT_PATH" \
+    --batch --passphrase-fd 3 3<<<"$GPG_SYMMETRIC_PASSWORD"
+
+echo
+echo
+echo "To verify: gpg -qd $BW_EXPORT_PATH | less"
+echo
+
+bw lock
